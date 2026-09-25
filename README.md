@@ -4,8 +4,9 @@
 同时返回分段 JSON 与 SRT 字幕文本；另提供**广告插播点**接口，在词间静音处选出
 总静音最长、满足间隔约束的插播位置，**说话人校正**接口，在人工锁定约束下
 以最小代价重指派说话人，**章节时刻对齐**接口，按章节 cue 文本在同一说话人
-连续词中的命中把章节锚定到词时间轴，以及**重复口播片段**接口，检测词序列
-完全相同的两处口播片段。基于 Python 3.12 + FastAPI。
+连续词中的命中把章节锚定到词时间轴，**重复口播片段**接口，检测词序列
+完全相同的两处口播片段，以及**敏感短语遮罩预览**接口，把命中敏感短语的字符
+逐字替换为 `█` 并回报每处命中位置。基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
 
@@ -21,6 +22,7 @@ docker compose up --build
 - 说话人校正接口：`POST http://localhost:8000/speaker-reconcile`
 - 章节时刻对齐接口：`POST http://localhost:8000/chapter-align`
 - 重复口播片段接口：`POST http://localhost:8000/duplicate-passages`
+- 敏感短语遮罩预览接口：`POST http://localhost:8000/redact-preview`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -467,13 +469,96 @@ curl -s http://localhost:8000/duplicate-passages \
 {"match": null}
 ```
 
+## 敏感短语遮罩预览：`POST /redact-preview`
+
+把每个**同一说话人连续区间**内所有词的 `text` 原样拼接（不插空格），在其中查找
+全部敏感短语的精确命中，把命中字符**逐字替换为 `█`**（每个字符一个 `█`）后返回
+完整词序列，并回报每处命中的位置。`words` 字段与 `/segments` 相同
+（至多 2000 词），并沿用同一套词序与时间校验（422 错误码一致）。
+
+服务地址：`POST http://localhost:8000/redact-preview`
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 800,  "text": "记得使用", "speaker": "A"},
+    {"start_ms": 800,  "end_ms": 1400, "text": "优惠码",   "speaker": "A"},
+    {"start_ms": 1400, "end_ms": 2000, "text": "八八八",   "speaker": "A"},
+    {"start_ms": 2200, "end_ms": 3400, "text": "别错过",   "speaker": "B"}
+  ],
+  "phrases": ["使用优惠码", "八八八"]
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `phrases` | 非空字符串数组，1～50 个 | 敏感短语列表；空字符串、超过 50 个或缺省均返回 422 |
+
+### 遮罩规则
+
+1. **匹配**：在每个同一说话人连续区间的拼接文本中查找短语的精确命中
+   （按 Unicode code point 比较，`😀` 算 1 个字符）。命中**允许跨词**，但
+   **不得跨越说话人边界**；同一文本中的重叠出现各自算一条候选命中
+   （如短语 `aa` 在 `aaa` 中有 2 条候选）；
+2. **重叠裁决**：候选按**起点靠前优先、同起点短语较长优先**的顺序贪心选出
+   互不重叠的命中——被跳过的候选都与某个优先级更高的已选命中重叠；
+3. **替换**：仅把选中字符逐字替换为 `█`（3 字符短语即替换为 3 个 `█`），
+   词序、时间、说话人一律不变；
+4. `words` 至多 **2000** 个词，超限返回 422（`invalid_request`）；
+5. 无任何命中时返回 **200**：`words` 与输入一致、`hits` 为空数组。
+
+### 响应示例（200）
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 800,  "text": "记得██", "speaker": "A"},
+    {"start_ms": 800,  "end_ms": 1400, "text": "███",    "speaker": "A"},
+    {"start_ms": 1400, "end_ms": 2000, "text": "███",    "speaker": "A"},
+    {"start_ms": 2200, "end_ms": 3400, "text": "别错过", "speaker": "B"}
+  ],
+  "hits": [
+    {"index": 0, "phrase": "使用优惠码", "start_word": 0, "end_word": 1, "start_char": 2, "end_char": 3},
+    {"index": 1, "phrase": "八八八",     "start_word": 2, "end_word": 2, "start_char": 0, "end_char": 3}
+  ]
+}
+```
+
+> `hits` 按命中位置升序，`index` 为 0-based 序号。`start_word` / `end_word` 为
+> 命中首、末字符所在词序号（0-based、含端点）；`start_char` / `end_char` 为命中
+> 在首词、末词内的 Unicode 字符偏移区间 `[start_char, ...)` / `(..., end_char)`：
+> 命中完全落在一个词内时 `start_word == end_word`；跨词命中覆盖中间词的全部字符。
+> 上例“使用优惠码”横跨词 0、1：词 0 的字符区间 `[2, 4)` 与词 1 整体被替换；
+> “别错过”属于另一说话人，不参与匹配。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/redact-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":800,"text":"记得使用","speaker":"A"},{"start_ms":800,"end_ms":1400,"text":"优惠码","speaker":"A"},{"start_ms":1400,"end_ms":2000,"text":"八八八","speaker":"A"},{"start_ms":2200,"end_ms":3400,"text":"别错过","speaker":"B"}],"phrases":["使用优惠码","八八八"]}'
+```
+
+### 无命中
+
+```json
+{
+  "words": [
+    {"start_ms": 0, "end_ms": 800, "text": "记得使用", "speaker": "A"}
+  ],
+  "hits": []
+}
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
@@ -555,6 +640,15 @@ O(H) 空间**（H 为各章命中候选总数）。每章候选按全局字符�
 一旦 `d` 小于当前最优长度即可整体剪掉；全程维护“最优长度 + 字典序最小起点对”，
 最后校验最优长度达到 `min_words`，否则返回 `match: null`。
 
+敏感短语遮罩预览（`redact_preview.py`）为候选枚举 + 按优先级单趟扫描，
+**O(P·T + H log H) 时间、O(T + H) 空间**（P 为短语数 ≤ 50、T 为全量拼接文本
+总字符数、H 为候选命中总数）。对每个同一说话人连续区间、每条短语，用
+`str.find` 枚举全部出现起点（每次从 `pos + 1` 继续，允许重叠出现）；候选按
+（起点升序、长度降序、短语输入序号升序）排序后单趟扫描，维护已选命中右端，
+起点不早于该右端的候选即被选中——排序保证被跳过的候选都与某个优先级更高的
+已选命中重叠；命中区间再经二分定位首末词，换算为首末词序号与两端词内字符偏移，
+最后仅把命中字符逐字替换为 `█`。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -581,6 +675,7 @@ app/
   speaker_reconcile.py  # 说话人校正（纯标准库，复用同一套输入校验）
   chapter_align.py      # 章节时刻对齐（纯标准库，复用同一套输入校验）
   duplicate_passages.py # 重复口播片段检测（纯标准库，复用同一套输入校验）
+  redact_preview.py     # 敏感短语遮罩预览（纯标准库，复用同一套输入校验）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -589,6 +684,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_speaker_reconcile.py
   test_chapter_align.py
   test_duplicate_passages.py
+  test_redact_preview.py
   test_differential.py
   test_api.py
 Dockerfile

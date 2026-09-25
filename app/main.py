@@ -1,6 +1,7 @@
 """FastAPI 入口：POST /segments 字幕分段、POST /ad-breaks 广告插播点、
 POST /speaker-reconcile 说话人校正、POST /chapter-align 章节时刻对齐、
-POST /duplicate-passages 重复口播片段检测服务。"""
+POST /duplicate-passages 重复口播片段检测、POST /redact-preview 敏感短语
+遮罩预览服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -10,6 +11,7 @@ from .ad_breaks import optimal_ad_breaks
 from .chapter_align import align_chapters
 from .duplicate_passages import find_duplicate_passages
 from .errors import DomainError
+from .redact_preview import redact_preview
 from .schemas import (
     AdBreakRequest,
     AdBreakResponse,
@@ -17,6 +19,8 @@ from .schemas import (
     ChapterAlignResponse,
     DuplicatePassagesRequest,
     DuplicatePassagesResponse,
+    RedactPreviewRequest,
+    RedactPreviewResponse,
     SegmentRequest,
     SegmentResponse,
     SpeakerReconcileRequest,
@@ -31,8 +35,9 @@ app = FastAPI(
     description="播客转写后处理：在硬约束下用动态规划求最优字幕分段（JSON 与 SRT），"
     "在词间静音处选择最优广告插播点，在人工锁定约束下校正说话人标注，"
     "按章节 cue 文本命中把章节对齐到词时间轴，"
-    "并检测词序列完全相同的重复口播片段。",
-    version="1.4.0",
+    "检测词序列完全相同的重复口播片段，"
+    "并对命中敏感短语的字符生成逐字遮罩预览。",
+    version="1.5.0",
 )
 
 
@@ -58,7 +63,9 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         "switch_cost∈[0,10]，locks 每项含整数 word_index 与非空 speaker；"
         "/chapter-align 另需非空 chapters（每项含非空 title/cue、非负整数 "
         "approx_ms）与正整数 min_gap_ms；/duplicate-passages 另需 "
-        "min_words∈[2,20]、非负整数 min_gap_ms，且 words 至多 2000 个",
+        "min_words∈[2,20]、非负整数 min_gap_ms，且 words 至多 2000 个；"
+        "/redact-preview 另需 phrases 为 1～50 个非空字符串，"
+        "且 words 至多 2000 个",
         {"errors": exc.errors()},
     )
 
@@ -125,3 +132,9 @@ async def create_duplicate_passages(request: DuplicatePassagesRequest):
         request.min_gap_ms,
     )
     return DuplicatePassagesResponse(match=match)
+
+
+@app.post("/redact-preview", response_model=RedactPreviewResponse)
+async def create_redact_preview(request: RedactPreviewRequest):
+    words, hits = redact_preview(request.words, request.phrases)
+    return RedactPreviewResponse(words=words, hits=hits)

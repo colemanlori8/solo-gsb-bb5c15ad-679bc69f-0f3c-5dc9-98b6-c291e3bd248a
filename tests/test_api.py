@@ -504,5 +504,123 @@ class DuplicatePassagesApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class RedactPreviewApiTests(unittest.TestCase):
+    WORDS = [
+        {"start_ms": 0, "end_ms": 800, "text": "记得使用", "speaker": "A"},
+        {"start_ms": 800, "end_ms": 1400, "text": "优惠码", "speaker": "A"},
+        {"start_ms": 1400, "end_ms": 2000, "text": "八八八", "speaker": "A"},
+        {"start_ms": 2200, "end_ms": 3400, "text": "别错过", "speaker": "B"},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"words": self.WORDS, "phrases": ["使用优惠码", "八八八"]}
+        payload.update(overrides)
+        return self.client.post("/redact-preview", json=payload)
+
+    def test_basic_redact(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(
+            [w["text"] for w in data["words"]],
+            ["记得██", "███", "███", "别错过"],
+        )
+        # 词序、时间、说话人保持不变
+        self.assertEqual(
+            [(w["start_ms"], w["end_ms"], w["speaker"]) for w in data["words"]],
+            [(0, 800, "A"), (800, 1400, "A"), (1400, 2000, "A"), (2200, 3400, "B")],
+        )
+        self.assertEqual(
+            data["hits"],
+            [
+                {
+                    "index": 0,
+                    "phrase": "使用优惠码",
+                    "start_word": 0,
+                    "end_word": 1,
+                    "start_char": 2,
+                    "end_char": 3,
+                },
+                {
+                    "index": 1,
+                    "phrase": "八八八",
+                    "start_word": 2,
+                    "end_word": 2,
+                    "start_char": 0,
+                    "end_char": 3,
+                },
+            ],
+        )
+
+    def test_hit_cannot_cross_speaker(self):
+        resp = self.post(phrases=["码八"])  # 词 1 末与词 2 首同属 A，可跨词命中
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()["hits"]), 1)
+        resp = self.post(phrases=["八别"])  # 跨说话人边界，不得命中
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["hits"], [])
+
+    def test_no_hit_returns_original_words(self):
+        resp = self.post(phrases=["不存在"])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["hits"], [])
+        self.assertEqual(data["words"], self.WORDS)
+
+    def test_overlap_resolution(self):
+        words = [{"start_ms": 0, "end_ms": 100, "text": "aaaaa", "speaker": "A"}]
+        resp = self.post(words=words, phrases=["aa"])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["words"][0]["text"], "████a")
+        self.assertEqual(
+            [(h["start_char"], h["end_char"]) for h in data["hits"]], [(0, 2), (2, 4)]
+        )
+        # 同起点短语较长优先
+        resp = self.post(words=words, phrases=["aa", "aaaa"])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["words"][0]["text"], "████a")
+        self.assertEqual([h["phrase"] for h in data["hits"]], ["aaaa"])
+
+    def test_phrases_count_out_of_range(self):
+        for bad in ([], ["甲"] * 51):
+            resp = self.post(phrases=bad)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_empty_phrase_rejected(self):
+        resp = self.post(phrases=["甲", ""])
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_words_over_2000_rejected(self):
+        words = [
+            {"start_ms": i * 500, "end_ms": i * 500 + 400, "text": "字", "speaker": "A"}
+            for i in range(2001)
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        # 2000 词恰好在上限内
+        resp = self.post(words=words[:2000])
+        self.assertEqual(resp.status_code, 200)
+
+    def test_word_validation_reused(self):
+        words = [dict(self.WORDS[1]), dict(self.WORDS[0])]  # 时间倒序
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+    def test_segments_still_works(self):
+        resp = self.client.post("/segments", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()

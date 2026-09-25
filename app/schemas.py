@@ -1,5 +1,7 @@
 """请求/响应 Pydantic 模型。"""
 
+from typing import Annotated
+
 from pydantic import BaseModel, Field
 
 
@@ -142,4 +144,38 @@ class DuplicatePassageMatch(BaseModel):
 class DuplicatePassagesResponse(BaseModel):
     match: DuplicatePassageMatch | None = Field(
         ..., description="词数最多的重复片段对；不足 min_words 时为 null"
+    )
+
+
+class RedactPreviewRequest(BaseModel):
+    words: list[WordIn] = Field(
+        ..., min_length=1, max_length=2000, description="按时间排列的词序列（至多 2000 词）"
+    )
+    phrases: list[Annotated[str, Field(min_length=1)]] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="敏感短语列表：1～50 个，每项为非空字符串",
+    )
+
+
+class RedactHitOut(BaseModel):
+    index: int
+    phrase: str = Field(..., description="命中的敏感短语")
+    start_word: int = Field(..., description="命中首字符所在词序号（0-based，含）")
+    end_word: int = Field(..., description="命中末字符所在词序号（0-based，含）")
+    start_char: int = Field(
+        ..., description="命中首字符在首词内的 Unicode 字符偏移（0-based，含）"
+    )
+    end_char: int = Field(
+        ..., description="命中末字符在末词内的字符偏移区间右端（不含）"
+    )
+
+
+class RedactPreviewResponse(BaseModel):
+    words: list[WordIn] = Field(
+        ..., description="遮罩后的词序列；词序、时间、说话人与输入一致，仅 text 被改写"
+    )
+    hits: list[RedactHitOut] = Field(
+        ..., description="按命中位置升序的命中列表；无命中时为空数组"
     )
